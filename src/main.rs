@@ -499,7 +499,7 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
     .clickable-row:hover {{ background: #f5f9ff; }}
     .detail-row-clickable {{ cursor: pointer; }}
     .detail-row-clickable.table-active {{ --bs-table-accent-bg: rgba(13,110,253,.18); }}
-    #modal-time-chart {{ width: 100%; height: 240px; }}
+    .chart-container {{ position: relative; width: 100%; min-height: 280px; }}
   </style>
 </head>
 <body class="bg-light">
@@ -593,7 +593,9 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
         </table>
         </div>
         <h3 class="h5 mt-3">Messages Over Time</h3>
-        <svg id="modal-time-chart" viewBox="0 0 900 220" preserveAspectRatio="none"></svg>
+        <div class="chart-container">
+          <canvas id="modal-time-chart"></canvas>
+        </div>
         </div>
       </div>
     </div>
@@ -601,6 +603,7 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
 
   </main>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   <script>
     const detailsByIp = {details_by_ip_json};
     const modalEl = document.getElementById('detail-modal');
@@ -608,6 +611,7 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
     const title = document.getElementById('modal-title');
     const body = document.getElementById('modal-table-body');
     const chart = document.getElementById('modal-time-chart');
+    let timeChart = null;
     let currentIp = null;
     let currentItems = [];
 
@@ -629,45 +633,71 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
 
       const days = Object.keys(perDay).sort();
       if (days.length === 0) {{
-        chart.innerHTML = '';
+        if (timeChart) {{
+          timeChart.destroy();
+          timeChart = null;
+        }}
         return;
       }}
 
       const values = days.map((d) => perDay[d]);
-      const maxValue = Math.max(...values, 1);
-      const width = 900;
-      const height = 220;
-      const left = 55;
-      const right = 20;
-      const top = 15;
-      const bottom = 45;
-      const plotWidth = width - left - right;
-      const plotHeight = height - top - bottom;
-      const stepX = days.length > 1 ? plotWidth / (days.length - 1) : 0;
-
-      const points = days.map((day, idx) => {{
-        const x = left + idx * stepX;
-        const y = top + plotHeight - (perDay[day] / maxValue) * plotHeight;
-        return {{ day, x, y, value: perDay[day] }};
-      }});
-
-      const polylinePoints = points.map((p) => p.x.toFixed(2) + ',' + p.y.toFixed(2)).join(' ');
-      let svg = '';
-      svg += '<line x1=\"' + left + '\" y1=\"' + (top + plotHeight) + '\" x2=\"' + (width - right) + '\" y2=\"' + (top + plotHeight) + '\" stroke=\"rgb(153,153,153)\" />';
-      svg += '<line x1=\"' + left + '\" y1=\"' + top + '\" x2=\"' + left + '\" y2=\"' + (top + plotHeight) + '\" stroke=\"rgb(153,153,153)\" />';
-      svg += '<polyline fill=\"none\" stroke=\"rgb(13,110,253)\" stroke-width=\"2\" points=\"' + polylinePoints + '\" />';
-
-      points.forEach((p, idx) => {{
-        svg += '<circle cx=\"' + p.x + '\" cy=\"' + p.y + '\" r=\"3\" fill=\"rgb(13,110,253)\"><title>' + escapeHtml(p.day) + ': ' + p.value + '</title></circle>';
-        svg += '<text x=\"' + p.x + '\" y=\"' + (height - 22) + '\" text-anchor=\"middle\" font-size=\"10\" fill=\"rgb(68,68,68)\">' + escapeHtml(p.day) + '</text>';
-        if (idx === 0 || idx === points.length - 1 || idx % 3 === 0) {{
-          svg += '<text x=\"' + p.x + '\" y=\"' + (p.y - 8) + '\" text-anchor=\"middle\" font-size=\"10\" fill=\"rgb(34,34,34)\">' + p.value + '</text>';
+      if (timeChart) {{
+        timeChart.destroy();
+      }}
+      timeChart = new Chart(chart, {{
+        type: 'line',
+        data: {{
+          labels: days,
+          datasets: [{{
+            label: 'Messages',
+            data: values,
+            borderColor: 'rgb(13, 110, 253)',
+            backgroundColor: 'rgba(13, 110, 253, 0.18)',
+            pointRadius: 3,
+            pointHoverRadius: 5,
+            fill: true,
+            tension: 0.25
+          }}]
+        }},
+        options: {{
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: {{
+            mode: 'index',
+            intersect: false
+          }},
+          plugins: {{
+            legend: {{
+              display: false
+            }},
+            tooltip: {{
+              callbacks: {{
+                title: (items) => 'Day: ' + (items[0]?.label || ''),
+                label: (item) => 'Messages: ' + item.formattedValue
+              }}
+            }}
+          }},
+          scales: {{
+            x: {{
+              ticks: {{
+                autoSkip: true,
+                maxRotation: 35,
+                minRotation: 20,
+                maxTicksLimit: 10
+              }},
+              grid: {{
+                display: false
+              }}
+            }},
+            y: {{
+              beginAtZero: true,
+              ticks: {{
+                precision: 0
+              }}
+            }}
+          }}
         }}
       }});
-
-      svg += '<text x=\"' + (left - 8) + '\" y=\"' + (top + 10) + '\" text-anchor=\"end\" font-size=\"10\" fill=\"rgb(68,68,68)\">' + maxValue + '</text>';
-      svg += '<text x=\"' + (left - 8) + '\" y=\"' + (top + plotHeight + 4) + '\" text-anchor=\"end\" font-size=\"10\" fill=\"rgb(68,68,68)\">0</text>';
-      chart.innerHTML = svg;
     }}
 
     function renderDetails(ip) {{
