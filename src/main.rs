@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::{TimeZone, Utc};
 use clap::Parser;
 use dns_lookup::lookup_addr;
 use flate2::read::GzDecoder;
@@ -35,7 +36,9 @@ struct ReportRecord {
     disposition: String,
     dkim: String,
     spf: String,
+    dmarc_compliant: bool,
     header_from: String,
+    report_day: String,
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
@@ -65,6 +68,27 @@ struct Aggregates {
     records: Vec<ReportRecord>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct ForensicReport {
+    arrival_day: String,
+    source_ip: String,
+    reported_domain: String,
+    delivery_result: String,
+    auth_failure: String,
+    user_agent: String,
+    original_envelope_id: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct ForensicAggregates {
+    total_reports: usize,
+    reports: Vec<ForensicReport>,
+    by_source_ip: HashMap<String, u64>,
+    by_reported_domain: HashMap<String, u64>,
+    by_auth_failure: HashMap<String, u64>,
+    by_delivery_result: HashMap<String, u64>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -76,6 +100,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("Creating output dir {}", cli.output.display()))?;
 
     let mut aggregates = Aggregates::default();
+    let mut forensic = ForensicAggregates::default();
 
     for entry in fs::read_dir(&cli.input)
         .with_context(|| format!("Reading input dir {}", cli.input.display()))?
@@ -83,26 +108,31 @@ fn main() -> Result<()> {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() {
-            process_file(&path, &mut aggregates)
+            process_file(&path, &mut aggregates, &mut forensic)
                 .with_context(|| format!("Processing {}", path.display()))?;
         }
     }
 
     resolve_source_ip_hostnames(&mut aggregates);
-    write_report(&cli.output, &aggregates)?;
+    write_reports(&cli.output, &aggregates, &forensic)?;
 
     println!(
-        "Report generated in {} (files: {}, reports: {}, records: {}).",
+        "Reports generated in {} (files: {}, aggregate reports: {}, aggregate records: {}, forensic reports: {}).",
         cli.output.display(),
         aggregates.total_files_processed,
         aggregates.total_reports,
-        aggregates.total_records
+        aggregates.total_records,
+        forensic.total_reports
     );
 
     Ok(())
 }
 
-fn process_file(path: &Path, aggregates: &mut Aggregates) -> Result<()> {
+fn process_file(
+    path: &Path,
+    aggregates: &mut Aggregates,
+    forensic: &mut ForensicAggregates,
+) -> Result<()> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -112,7 +142,7 @@ fn process_file(path: &Path, aggregates: &mut Aggregates) -> Result<()> {
     match ext.as_str() {
         "xml" => {
             let data = fs::read(path)?;
-            process_xml_bytes(&data, aggregates)
+            process_xml_bytes(&data, aggregates, forensic)
                 .with_context(|| format!("Invalid XML in {}", path.display()))?;
             aggregates.total_files_processed += 1;
         }
@@ -122,7 +152,7 @@ fn process_file(path: &Path, aggregates: &mut Aggregates) -> Result<()> {
             let mut decoded = Vec::new();
             gz.read_to_end(&mut decoded)
                 .with_context(|| format!("Invalid gzip in {}", path.display()))?;
-            process_xml_bytes(&decoded, aggregates)
+            process_xml_bytes(&decoded, aggregates, forensic)
                 .with_context(|| format!("Invalid XML in gz file {}", path.display()))?;
             aggregates.total_files_processed += 1;
         }
@@ -138,7 +168,7 @@ fn process_file(path: &Path, aggregates: &mut Aggregates) -> Result<()> {
                 if name.ends_with(".xml") {
                     let mut xml = Vec::new();
                     zipped.read_to_end(&mut xml)?;
-                    process_xml_bytes(&xml, aggregates).with_context(|| {
+                    process_xml_bytes(&xml, aggregates, forensic).with_context(|| {
                         format!("Invalid XML in zip member {} of {}", zipped.name(), path.display())
                     })?;
                     xml_found = true;
@@ -156,13 +186,26 @@ fn process_file(path: &Path, aggregates: &mut Aggregates) -> Result<()> {
     Ok(())
 }
 
-fn process_xml_bytes(bytes: &[u8], aggregates: &mut Aggregates) -> Result<()> {
+fn process_xml_bytes(
+    bytes: &[u8],
+    aggregates: &mut Aggregates,
+    forensic: &mut ForensicAggregates,
+) -> Result<()> {
     let s = std::str::from_utf8(bytes).context("DMARC XML is not valid UTF-8")?;
     let doc = Document::parse(s).context("Cannot parse DMARC XML document")?;
 
-    validate_required_nodes(&doc)?;
+    if looks_like_aggregate_report(&doc) {
+        process_aggregate_xml(&doc, aggregates)
+    } else if looks_like_forensic_report(&doc) {
+        process_forensic_xml(&doc, forensic)
+    } else {
+        bail!("XML does not look like a DMARC aggregate or forensic report");
+    }
+}
 
+fn process_aggregate_xml(doc: &Document<'_>, aggregates: &mut Aggregates) -> Result<()> {
     aggregates.total_reports += 1;
+    let report_day = extract_report_day(doc);
 
     for record in doc.descendants().filter(|n| n.has_tag_name("record")) {
         let source_ip = child_text(record, "row/source_ip").unwrap_or_else(|| "unknown".to_string());
@@ -174,6 +217,7 @@ fn process_xml_bytes(bytes: &[u8], aggregates: &mut Aggregates) -> Result<()> {
         let dkim = child_text(record, "row/policy_evaluated/dkim").unwrap_or_else(|| "unknown".to_string());
         let spf = child_text(record, "row/policy_evaluated/spf").unwrap_or_else(|| "unknown".to_string());
         let header_from = child_text(record, "identifiers/header_from").unwrap_or_else(|| "unknown".to_string());
+        let dmarc_compliant = spf.eq_ignore_ascii_case("pass") || dkim.eq_ignore_ascii_case("pass");
 
         aggregates.total_records += 1;
         aggregates.total_messages += count;
@@ -191,22 +235,76 @@ fn process_xml_bytes(bytes: &[u8], aggregates: &mut Aggregates) -> Result<()> {
             disposition,
             dkim,
             spf,
+            dmarc_compliant,
             header_from,
+            report_day: report_day.clone(),
         });
     }
 
     Ok(())
 }
 
-fn validate_required_nodes(doc: &Document<'_>) -> Result<()> {
+fn extract_report_day(doc: &Document<'_>) -> String {
+    let begin_epoch = doc
+        .descendants()
+        .find(|n| n.has_tag_name("date_range"))
+        .and_then(|n| n.children().find(|c| c.has_tag_name("begin")))
+        .and_then(|n| n.text())
+        .and_then(|s| s.trim().parse::<i64>().ok());
+
+    begin_epoch
+        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn looks_like_aggregate_report(doc: &Document<'_>) -> bool {
     let has_feedback = doc.descendants().any(|n| n.has_tag_name("feedback"));
     let has_metadata = doc.descendants().any(|n| n.has_tag_name("report_metadata"));
     let has_policy = doc.descendants().any(|n| n.has_tag_name("policy_published"));
     let has_record = doc.descendants().any(|n| n.has_tag_name("record"));
+    has_feedback && has_metadata && has_policy && has_record
+}
 
-    if !has_feedback || !has_metadata || !has_policy || !has_record {
-        bail!("XML does not look like a DMARC aggregate report");
-    }
+fn looks_like_forensic_report(doc: &Document<'_>) -> bool {
+    let has_feedback = doc.descendants().any(|n| n.has_tag_name("feedback"));
+    let has_source_ip = doc.descendants().any(|n| n.has_tag_name("source_ip"));
+    let has_arrival = doc.descendants().any(|n| n.has_tag_name("arrival_date"));
+    let has_reported_domain = doc.descendants().any(|n| n.has_tag_name("reported_domain"));
+    has_feedback && (has_source_ip || has_arrival || has_reported_domain)
+}
+
+fn process_forensic_xml(doc: &Document<'_>, forensic: &mut ForensicAggregates) -> Result<()> {
+    let source_ip = first_tag_text(doc, "source_ip").unwrap_or_else(|| "unknown".to_string());
+    let reported_domain =
+        first_tag_text(doc, "reported_domain").unwrap_or_else(|| "unknown".to_string());
+    let auth_failure = first_tag_text(doc, "auth_failure").unwrap_or_else(|| "unknown".to_string());
+    let delivery_result =
+        first_tag_text(doc, "delivery_result").unwrap_or_else(|| "unknown".to_string());
+    let user_agent = first_tag_text(doc, "user_agent").unwrap_or_else(|| "unknown".to_string());
+    let original_envelope_id =
+        first_tag_text(doc, "original_envelope_id").unwrap_or_else(|| "unknown".to_string());
+
+    let arrival_day = first_tag_text(doc, "arrival_date")
+        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    forensic.total_reports += 1;
+    increment_map(&mut forensic.by_source_ip, &source_ip, 1);
+    increment_map(&mut forensic.by_reported_domain, &reported_domain, 1);
+    increment_map(&mut forensic.by_auth_failure, &auth_failure, 1);
+    increment_map(&mut forensic.by_delivery_result, &delivery_result, 1);
+    forensic.reports.push(ForensicReport {
+        arrival_day,
+        source_ip,
+        reported_domain,
+        delivery_result,
+        auth_failure,
+        user_agent,
+        original_envelope_id,
+    });
     Ok(())
 }
 
@@ -272,8 +370,12 @@ fn resolve_source_ip_hostnames(aggregates: &mut Aggregates) {
     }
 }
 
-fn write_report(output_dir: &Path, aggregates: &Aggregates) -> Result<()> {
-    let html = render_html(aggregates)?;
+fn write_reports(
+    output_dir: &Path,
+    aggregates: &Aggregates,
+    forensic: &ForensicAggregates,
+) -> Result<()> {
+    let html = render_aggregate_html(aggregates)?;
     let index_path = output_dir.join("index.html");
     fs::write(&index_path, html).with_context(|| format!("Writing {}", index_path.display()))?;
 
@@ -281,10 +383,20 @@ fn write_report(output_dir: &Path, aggregates: &Aggregates) -> Result<()> {
     let json = serde_json::to_string_pretty(aggregates)?;
     fs::write(&json_path, json).with_context(|| format!("Writing {}", json_path.display()))?;
 
+    let forensic_dir = output_dir.join("forensic");
+    fs::create_dir_all(&forensic_dir)
+        .with_context(|| format!("Creating {}", forensic_dir.display()))?;
+    let forensic_html = render_forensic_html(forensic)?;
+    fs::write(forensic_dir.join("index.html"), forensic_html)
+        .with_context(|| format!("Writing {}", forensic_dir.join("index.html").display()))?;
+    let forensic_json = serde_json::to_string_pretty(forensic)?;
+    fs::write(forensic_dir.join("data.json"), forensic_json)
+        .with_context(|| format!("Writing {}", forensic_dir.join("data.json").display()))?;
+
     Ok(())
 }
 
-fn render_html(aggregates: &Aggregates) -> Result<String> {
+fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
     let source_ip_rows = render_source_ip_rows(
         &aggregates.source_ip_counts,
         &aggregates.source_ip_hostnames,
@@ -294,6 +406,7 @@ fn render_html(aggregates: &Aggregates) -> Result<String> {
     let disposition_rows = render_table_rows(&aggregates.disposition_counts);
     let dkim_rows = render_table_rows(&aggregates.dkim_result_counts);
     let spf_rows = render_table_rows(&aggregates.spf_result_counts);
+    let details_by_ip_json = serde_json::to_string(&group_records_by_source_ip(&aggregates.records))?;
 
     let html = format!(
         r#"<!doctype html>
@@ -311,6 +424,40 @@ fn render_html(aggregates: &Aggregates) -> Result<String> {
     th, td {{ border: 1px solid #ddd; padding: 0.5rem; text-align: left; }}
     th {{ background: #f3f3f3; }}
     .muted {{ color: #666; font-size: 0.9rem; }}
+    .clickable-row {{ cursor: pointer; }}
+    .clickable-row:hover {{ background: #f8fbff; }}
+    .modal-overlay {{
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.45);
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+      box-sizing: border-box;
+    }}
+    .modal {{
+      background: #fff;
+      width: min(1100px, 100%);
+      max-height: 85vh;
+      overflow: auto;
+      border-radius: 8px;
+      padding: 1rem;
+      box-sizing: border-box;
+    }}
+    .modal-header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.75rem;
+    }}
+    .close-btn {{
+      border: 1px solid #ccc;
+      background: #f5f5f5;
+      border-radius: 6px;
+      padding: 0.4rem 0.7rem;
+      cursor: pointer;
+    }}
   </style>
 </head>
 <body>
@@ -339,6 +486,7 @@ fn render_html(aggregates: &Aggregates) -> Result<String> {
     </tr>
     {source_ip_rows}
   </table>
+  <p class="muted">Click a source IP row for detailed records.</p>
 
   <h2>By Header From</h2>
   <table><tr><th>Header From</th><th>Message Count</th></tr>{header_from_rows}</table>
@@ -353,6 +501,143 @@ fn render_html(aggregates: &Aggregates) -> Result<String> {
   <table><tr><th>SPF</th><th>Message Count</th></tr>{spf_rows}</table>
 
   <p class="muted">Raw aggregated JSON is available as <code>data.json</code>.</p>
+  <p class="muted">Forensic report site: <code>forensic/index.html</code>.</p>
+
+  <div id="detail-modal-overlay" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="modal-title">Source IP details</h2>
+        <button id="modal-close" class="close-btn" type="button">Close</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Source IP</th>
+            <th>Report Day</th>
+            <th>Message Count</th>
+            <th>DMARC Compliance</th>
+            <th>Disposition</th>
+            <th>SPF</th>
+            <th>DKIM</th>
+            <th>Header From</th>
+          </tr>
+        </thead>
+        <tbody id="modal-table-body"></tbody>
+      </table>
+      <h3>Messages Over Time</h3>
+      <svg id="modal-time-chart" width="100%" height="220" viewBox="0 0 900 220" preserveAspectRatio="none"></svg>
+    </div>
+  </div>
+
+  <script>
+    const detailsByIp = {details_by_ip_json};
+    const overlay = document.getElementById('detail-modal-overlay');
+    const title = document.getElementById('modal-title');
+    const body = document.getElementById('modal-table-body');
+    const closeBtn = document.getElementById('modal-close');
+    const chart = document.getElementById('modal-time-chart');
+
+    function escapeHtml(text) {{
+      return String(text)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('\"', '&quot;')
+        .replaceAll('\'', '&#39;');
+    }}
+
+    function renderTimeChart(items) {{
+      const perDay = {{}};
+      items.forEach((item) => {{
+        const key = item.report_day || 'unknown';
+        perDay[key] = (perDay[key] || 0) + Number(item.count || 0);
+      }});
+
+      const days = Object.keys(perDay).sort();
+      if (days.length === 0) {{
+        chart.innerHTML = '';
+        return;
+      }}
+
+      const values = days.map((d) => perDay[d]);
+      const maxValue = Math.max(...values, 1);
+      const width = 900;
+      const height = 220;
+      const left = 55;
+      const right = 20;
+      const top = 15;
+      const bottom = 45;
+      const plotWidth = width - left - right;
+      const plotHeight = height - top - bottom;
+      const stepX = days.length > 1 ? plotWidth / (days.length - 1) : 0;
+
+      const points = days.map((day, idx) => {{
+        const x = left + idx * stepX;
+        const y = top + plotHeight - (perDay[day] / maxValue) * plotHeight;
+        return {{ day, x, y, value: perDay[day] }};
+      }});
+
+      const polylinePoints = points.map((p) => p.x.toFixed(2) + ',' + p.y.toFixed(2)).join(' ');
+      let svg = '';
+      svg += '<line x1=\"' + left + '\" y1=\"' + (top + plotHeight) + '\" x2=\"' + (width - right) + '\" y2=\"' + (top + plotHeight) + '\" stroke=\"rgb(153,153,153)\" />';
+      svg += '<line x1=\"' + left + '\" y1=\"' + top + '\" x2=\"' + left + '\" y2=\"' + (top + plotHeight) + '\" stroke=\"rgb(153,153,153)\" />';
+      svg += '<polyline fill=\"none\" stroke=\"rgb(13,110,253)\" stroke-width=\"2\" points=\"' + polylinePoints + '\" />';
+
+      points.forEach((p, idx) => {{
+        svg += '<circle cx=\"' + p.x + '\" cy=\"' + p.y + '\" r=\"3\" fill=\"rgb(13,110,253)\"><title>' + escapeHtml(p.day) + ': ' + p.value + '</title></circle>';
+        svg += '<text x=\"' + p.x + '\" y=\"' + (height - 22) + '\" text-anchor=\"middle\" font-size=\"10\" fill=\"rgb(68,68,68)\">' + escapeHtml(p.day) + '</text>';
+        if (idx === 0 || idx === points.length - 1 || idx % 3 === 0) {{
+          svg += '<text x=\"' + p.x + '\" y=\"' + (p.y - 8) + '\" text-anchor=\"middle\" font-size=\"10\" fill=\"rgb(34,34,34)\">' + p.value + '</text>';
+        }}
+      }});
+
+      svg += '<text x=\"' + (left - 8) + '\" y=\"' + (top + 10) + '\" text-anchor=\"end\" font-size=\"10\" fill=\"rgb(68,68,68)\">' + maxValue + '</text>';
+      svg += '<text x=\"' + (left - 8) + '\" y=\"' + (top + plotHeight + 4) + '\" text-anchor=\"end\" font-size=\"10\" fill=\"rgb(68,68,68)\">0</text>';
+      chart.innerHTML = svg;
+    }}
+
+    function openDetails(ip) {{
+      const items = detailsByIp[ip] || [];
+      title.textContent = 'Source IP details: ' + ip + ' (' + items.length + ' records)';
+
+      if (items.length === 0) {{
+        body.innerHTML = '<tr><td colspan=\"8\">No details available.</td></tr>';
+      }} else {{
+        body.innerHTML = items.map((item) => (
+          '<tr>' +
+            '<td>' + escapeHtml(item.source_ip) + '</td>' +
+            '<td>' + escapeHtml(item.report_day || 'unknown') + '</td>' +
+            '<td>' + item.count + '</td>' +
+            '<td>' + (item.dmarc_compliant ? 'pass' : 'fail') + '</td>' +
+            '<td>' + escapeHtml(item.disposition) + '</td>' +
+            '<td>' + escapeHtml(item.spf) + '</td>' +
+            '<td>' + escapeHtml(item.dkim) + '</td>' +
+            '<td>' + escapeHtml(item.header_from) + '</td>' +
+          '</tr>'
+        )).join('');
+      }}
+      renderTimeChart(items);
+
+      overlay.style.display = 'flex';
+    }}
+
+    function closeDetails() {{
+      overlay.style.display = 'none';
+    }}
+
+    closeBtn.addEventListener('click', closeDetails);
+    overlay.addEventListener('click', (event) => {{
+      if (event.target === overlay) {{
+        closeDetails();
+      }}
+    }});
+
+    document.querySelectorAll('.source-ip-row').forEach((row) => {{
+      row.addEventListener('click', () => {{
+        openDetails(row.dataset.sourceIp);
+      }});
+    }});
+  </script>
 </body>
 </html>"#,
         files = aggregates.total_files_processed,
@@ -364,6 +649,93 @@ fn render_html(aggregates: &Aggregates) -> Result<String> {
         disposition_rows = disposition_rows,
         dkim_rows = dkim_rows,
         spf_rows = spf_rows,
+        details_by_ip_json = details_by_ip_json,
+    );
+
+    Ok(html)
+}
+
+fn render_forensic_html(forensic: &ForensicAggregates) -> Result<String> {
+    let source_ip_rows = render_table_rows(&forensic.by_source_ip);
+    let domain_rows = render_table_rows(&forensic.by_reported_domain);
+    let auth_failure_rows = render_table_rows(&forensic.by_auth_failure);
+    let delivery_result_rows = render_table_rows(&forensic.by_delivery_result);
+    let reports_json = serde_json::to_string(&forensic.reports)?;
+
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DMARC Forensic Reports</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 1.5rem; color: #222; }}
+    h1, h2 {{ margin-bottom: 0.5rem; }}
+    table {{ border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }}
+    th, td {{ border: 1px solid #ddd; padding: 0.5rem; text-align: left; }}
+    th {{ background: #f3f3f3; }}
+    .muted {{ color: #666; font-size: 0.9rem; }}
+  </style>
+</head>
+<body>
+  <h1>DMARC Forensic Statistics</h1>
+  <p class="muted">Generated by dmarky</p>
+  <p class="muted">Back to aggregate report: <code>../index.html</code></p>
+  <h2>Overview</h2>
+  <table><tr><th>Total Forensic Reports</th></tr><tr><td>{total_reports}</td></tr></table>
+  <h2>By Source IP</h2>
+  <table><tr><th>Source IP</th><th>Count</th></tr>{source_ip_rows}</table>
+  <h2>By Reported Domain</h2>
+  <table><tr><th>Reported Domain</th><th>Count</th></tr>{domain_rows}</table>
+  <h2>By Auth Failure</h2>
+  <table><tr><th>Auth Failure</th><th>Count</th></tr>{auth_failure_rows}</table>
+  <h2>By Delivery Result</h2>
+  <table><tr><th>Delivery Result</th><th>Count</th></tr>{delivery_result_rows}</table>
+  <h2>Forensic Report Details</h2>
+  <table>
+    <tr>
+      <th>Arrival Day</th>
+      <th>Source IP</th>
+      <th>Reported Domain</th>
+      <th>Auth Failure</th>
+      <th>Delivery Result</th>
+      <th>User Agent</th>
+      <th>Envelope ID</th>
+    </tr>
+    <tbody id="forensic-details-body"></tbody>
+  </table>
+  <script>
+    const reports = {reports_json};
+    function escapeHtml(text) {{
+      return String(text)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('\"', '&quot;')
+        .replaceAll('\'', '&#39;');
+    }}
+    const body = document.getElementById('forensic-details-body');
+    body.innerHTML = reports.map((r) => (
+      '<tr>' +
+      '<td>' + escapeHtml(r.arrival_day) + '</td>' +
+      '<td>' + escapeHtml(r.source_ip) + '</td>' +
+      '<td>' + escapeHtml(r.reported_domain) + '</td>' +
+      '<td>' + escapeHtml(r.auth_failure) + '</td>' +
+      '<td>' + escapeHtml(r.delivery_result) + '</td>' +
+      '<td>' + escapeHtml(r.user_agent) + '</td>' +
+      '<td>' + escapeHtml(r.original_envelope_id) + '</td>' +
+      '</tr>'
+    )).join('');
+  </script>
+</body>
+</html>"#,
+        total_reports = forensic.total_reports,
+        source_ip_rows = source_ip_rows,
+        domain_rows = domain_rows,
+        auth_failure_rows = auth_failure_rows,
+        delivery_result_rows = delivery_result_rows,
+        reports_json = reports_json
     );
 
     Ok(html)
@@ -400,7 +772,8 @@ fn render_source_ip_rows(
             .unwrap_or_else(|| "unresolved".to_string());
         let stats = stats_map.get(ip.as_str()).cloned().unwrap_or_default();
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr class=\"source-ip-row clickable-row\" data-source-ip=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(ip),
             escape_html(ip),
             escape_html(&hostname),
             count,
@@ -413,6 +786,24 @@ fn render_source_ip_rows(
         ));
     }
     rows
+}
+
+fn group_records_by_source_ip(records: &[ReportRecord]) -> HashMap<String, Vec<ReportRecord>> {
+    let mut grouped: HashMap<String, Vec<ReportRecord>> = HashMap::new();
+    for record in records {
+        grouped
+            .entry(record.source_ip.clone())
+            .or_default()
+            .push(record.clone());
+    }
+    grouped
+}
+
+fn first_tag_text(doc: &Document<'_>, tag_name: &str) -> Option<String> {
+    doc.descendants()
+        .find(|n| n.has_tag_name(tag_name))
+        .and_then(|n| n.text())
+        .map(|s| s.trim().to_string())
 }
 
 fn escape_html(s: &str) -> String {
