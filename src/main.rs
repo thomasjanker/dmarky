@@ -481,6 +481,8 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
   <style>
     .clickable-row {{ cursor: pointer; }}
     .clickable-row:hover {{ background: #f5f9ff; }}
+    .detail-row-clickable {{ cursor: pointer; }}
+    .detail-row-clickable.table-active {{ --bs-table-accent-bg: rgba(13,110,253,.18); }}
     #modal-time-chart {{ width: 100%; height: 240px; }}
   </style>
 </head>
@@ -543,10 +545,7 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
           <button id="modal-close" class="btn-close" type="button" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
-        <div class="form-check mb-3">
-          <input id="modal-filter-failed" class="form-check-input" type="checkbox" />
-          <label class="form-check-label" for="modal-filter-failed">Show only failed DMARC entries</label>
-        </div>
+        <p class="text-muted mb-2">Click a detail row to update the time chart for that row's values.</p>
         <div class="table-responsive">
         <table class="table table-striped table-sm align-middle">
           <thead class="table-light">
@@ -578,8 +577,8 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
     const title = document.getElementById('modal-title');
     const body = document.getElementById('modal-table-body');
     const chart = document.getElementById('modal-time-chart');
-    const failedOnlyCheckbox = document.getElementById('modal-filter-failed');
     let currentIp = null;
+    let currentItems = [];
 
     function escapeHtml(text) {{
       return String(text)
@@ -642,17 +641,15 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
 
     function renderDetails(ip) {{
       const allItems = detailsByIp[ip] || [];
-      const items = failedOnlyCheckbox.checked
-        ? allItems.filter((item) => !item.dmarc_compliant)
-        : allItems;
+      currentItems = allItems;
       title.textContent =
-        'Source IP details: ' + ip + ' (' + items.length + ' of ' + allItems.length + ' records)';
+        'Source IP details: ' + ip + ' (' + allItems.length + ' records)';
 
-      if (items.length === 0) {{
+      if (allItems.length === 0) {{
         body.innerHTML = '<tr><td colspan=\"6\">No details available.</td></tr>';
       }} else {{
         const grouped = {{}};
-        items.forEach((item) => {{
+        allItems.forEach((item) => {{
           const key = [
             item.dmarc_compliant ? 'pass' : 'fail',
             item.disposition || 'unknown',
@@ -675,8 +672,8 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
         }});
 
         const groupedRows = Object.values(grouped).sort((a, b) => b.message_count - a.message_count);
-        body.innerHTML = groupedRows.map((row) => (
-          '<tr>' +
+        body.innerHTML = groupedRows.map((row, idx) => (
+          '<tr class=\"detail-row-clickable\" data-group-idx=\"' + idx + '\">' +
             '<td>' + row.message_count + '</td>' +
             '<td>' + row.dmarc_compliance + '</td>' +
             '<td>' + escapeHtml(row.disposition) + '</td>' +
@@ -685,8 +682,26 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
             '<td>' + escapeHtml(row.header_from) + '</td>' +
           '</tr>'
         )).join('');
+
+        document.querySelectorAll('.detail-row-clickable').forEach((rowEl) => {{
+          rowEl.addEventListener('click', () => {{
+            document.querySelectorAll('.detail-row-clickable').forEach((r) => r.classList.remove('table-active'));
+            rowEl.classList.add('table-active');
+
+            const selected = groupedRows[Number(rowEl.dataset.groupIdx)];
+            const filtered = currentItems.filter((item) => {{
+              const dmarc = item.dmarc_compliant ? 'pass' : 'fail';
+              return dmarc === selected.dmarc_compliance
+                && (item.disposition || 'unknown') === selected.disposition
+                && (item.spf || 'unknown') === selected.spf
+                && (item.dkim || 'unknown') === selected.dkim
+                && (item.header_from || 'unknown') === selected.header_from;
+            }});
+            renderTimeChart(filtered);
+          }});
+        }});
       }}
-      renderTimeChart(items);
+      renderTimeChart(allItems);
     }}
 
     function openDetails(ip) {{
@@ -698,12 +713,6 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
     function closeDetails() {{
       modal.hide();
     }}
-
-    failedOnlyCheckbox.addEventListener('change', () => {{
-      if (currentIp) {{
-        renderDetails(currentIp);
-      }}
-    }});
 
     document.querySelectorAll('.source-ip-row').forEach((row) => {{
       row.addEventListener('click', () => {{
