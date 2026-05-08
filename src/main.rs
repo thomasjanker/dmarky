@@ -39,6 +39,8 @@ struct ReportRecord {
     dmarc_compliant: bool,
     header_from: String,
     report_day: String,
+    report_org_name: String,
+    report_email: String,
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
@@ -77,6 +79,8 @@ struct ForensicReport {
     auth_failure: String,
     user_agent: String,
     original_envelope_id: String,
+    report_org_name: String,
+    report_email: String,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -87,6 +91,7 @@ struct ForensicAggregates {
     by_reported_domain: HashMap<String, u64>,
     by_auth_failure: HashMap<String, u64>,
     by_delivery_result: HashMap<String, u64>,
+    by_report_origin: HashMap<String, u64>,
 }
 
 fn main() -> Result<()> {
@@ -206,6 +211,8 @@ fn process_xml_bytes(
 fn process_aggregate_xml(doc: &Document<'_>, aggregates: &mut Aggregates) -> Result<()> {
     aggregates.total_reports += 1;
     let report_day = extract_report_day(doc);
+    let report_org_name = first_tag_text(doc, "org_name").unwrap_or_else(|| "unknown".to_string());
+    let report_email = first_tag_text(doc, "email").unwrap_or_else(|| "unknown".to_string());
 
     for record in doc.descendants().filter(|n| n.has_tag_name("record")) {
         let source_ip = child_text(record, "row/source_ip").unwrap_or_else(|| "unknown".to_string());
@@ -238,6 +245,8 @@ fn process_aggregate_xml(doc: &Document<'_>, aggregates: &mut Aggregates) -> Res
             dmarc_compliant,
             header_from,
             report_day: report_day.clone(),
+            report_org_name: report_org_name.clone(),
+            report_email: report_email.clone(),
         });
     }
 
@@ -284,6 +293,9 @@ fn process_forensic_xml(doc: &Document<'_>, forensic: &mut ForensicAggregates) -
     let user_agent = first_tag_text(doc, "user_agent").unwrap_or_else(|| "unknown".to_string());
     let original_envelope_id =
         first_tag_text(doc, "original_envelope_id").unwrap_or_else(|| "unknown".to_string());
+    let report_org_name = first_tag_text(doc, "org_name").unwrap_or_else(|| "unknown".to_string());
+    let report_email = first_tag_text(doc, "email").unwrap_or_else(|| "unknown".to_string());
+    let report_origin = format!("{} <{}>", report_org_name, report_email);
 
     let arrival_day = first_tag_text(doc, "arrival_date")
         .and_then(|s| s.parse::<i64>().ok())
@@ -296,6 +308,7 @@ fn process_forensic_xml(doc: &Document<'_>, forensic: &mut ForensicAggregates) -
     increment_map(&mut forensic.by_reported_domain, &reported_domain, 1);
     increment_map(&mut forensic.by_auth_failure, &auth_failure, 1);
     increment_map(&mut forensic.by_delivery_result, &delivery_result, 1);
+    increment_map(&mut forensic.by_report_origin, &report_origin, 1);
     forensic.reports.push(ForensicReport {
         arrival_day,
         source_ip,
@@ -304,6 +317,8 @@ fn process_forensic_xml(doc: &Document<'_>, forensic: &mut ForensicAggregates) -
         auth_failure,
         user_agent,
         original_envelope_id,
+        report_org_name,
+        report_email,
     });
     Ok(())
 }
@@ -514,6 +529,7 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
           <tr>
             <th>Source IP</th>
             <th>Report Day</th>
+            <th>Report Origin</th>
             <th>Message Count</th>
             <th>DMARC Compliance</th>
             <th>Disposition</th>
@@ -601,12 +617,13 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
       title.textContent = 'Source IP details: ' + ip + ' (' + items.length + ' records)';
 
       if (items.length === 0) {{
-        body.innerHTML = '<tr><td colspan=\"8\">No details available.</td></tr>';
+        body.innerHTML = '<tr><td colspan=\"9\">No details available.</td></tr>';
       }} else {{
         body.innerHTML = items.map((item) => (
           '<tr>' +
             '<td>' + escapeHtml(item.source_ip) + '</td>' +
             '<td>' + escapeHtml(item.report_day || 'unknown') + '</td>' +
+            '<td>' + escapeHtml((item.report_org_name || 'unknown') + ' <' + (item.report_email || 'unknown') + '>') + '</td>' +
             '<td>' + item.count + '</td>' +
             '<td>' + (item.dmarc_compliant ? 'pass' : 'fail') + '</td>' +
             '<td>' + escapeHtml(item.disposition) + '</td>' +
@@ -660,6 +677,7 @@ fn render_forensic_html(forensic: &ForensicAggregates) -> Result<String> {
     let domain_rows = render_table_rows(&forensic.by_reported_domain);
     let auth_failure_rows = render_table_rows(&forensic.by_auth_failure);
     let delivery_result_rows = render_table_rows(&forensic.by_delivery_result);
+    let report_origin_rows = render_table_rows(&forensic.by_report_origin);
     let reports_json = serde_json::to_string(&forensic.reports)?;
 
     let html = format!(
@@ -692,11 +710,14 @@ fn render_forensic_html(forensic: &ForensicAggregates) -> Result<String> {
   <table><tr><th>Auth Failure</th><th>Count</th></tr>{auth_failure_rows}</table>
   <h2>By Delivery Result</h2>
   <table><tr><th>Delivery Result</th><th>Count</th></tr>{delivery_result_rows}</table>
+  <h2>By Report Origin</h2>
+  <table><tr><th>Report Origin</th><th>Count</th></tr>{report_origin_rows}</table>
   <h2>Forensic Report Details</h2>
   <table>
     <tr>
       <th>Arrival Day</th>
       <th>Source IP</th>
+      <th>Report Origin</th>
       <th>Reported Domain</th>
       <th>Auth Failure</th>
       <th>Delivery Result</th>
@@ -720,6 +741,7 @@ fn render_forensic_html(forensic: &ForensicAggregates) -> Result<String> {
       '<tr>' +
       '<td>' + escapeHtml(r.arrival_day) + '</td>' +
       '<td>' + escapeHtml(r.source_ip) + '</td>' +
+      '<td>' + escapeHtml((r.report_org_name || 'unknown') + ' <' + (r.report_email || 'unknown') + '>') + '</td>' +
       '<td>' + escapeHtml(r.reported_domain) + '</td>' +
       '<td>' + escapeHtml(r.auth_failure) + '</td>' +
       '<td>' + escapeHtml(r.delivery_result) + '</td>' +
@@ -735,6 +757,7 @@ fn render_forensic_html(forensic: &ForensicAggregates) -> Result<String> {
         domain_rows = domain_rows,
         auth_failure_rows = auth_failure_rows,
         delivery_result_rows = delivery_result_rows,
+        report_origin_rows = report_origin_rows,
         reports_json = reports_json
     );
 

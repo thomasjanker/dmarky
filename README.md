@@ -30,6 +30,7 @@ Then open:
 
 - Source IP (`record/row/source_ip`)
 - Reverse DNS hostname for each source IP (PTR lookup)
+- Report origin (`report_metadata/org_name`, `report_metadata/email`)
 - Header From (`record/identifiers/header_from`)
 - Disposition (`record/row/policy_evaluated/disposition`)
 - DKIM result (`record/row/policy_evaluated/dkim`)
