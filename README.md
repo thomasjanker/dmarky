@@ -8,9 +8,11 @@ Rust CLI to analyze DMARC reports from a local folder and generate static browsa
 - Detects DMARC aggregate and forensic XML reports
 - Aggregates simple statistics across all files in the folder
 - Generates static output (no DB, no webserver):
+  - Landing page:
+    - `index.html` (choose aggregate or forensic)
   - Aggregate site:
-    - `index.html`
-    - `data.json`
+    - `aggregate/index.html`
+    - `aggregate/data.json`
   - Forensic site:
     - `forensic/index.html`
     - `forensic/data.json`
@@ -24,6 +26,8 @@ cargo run -- --input /path/to/dmarc/reports --output report
 Then open:
 
 - `report/index.html` for aggregate statistics
+- `report/index.html` as entry page (choose report type)
+- `report/aggregate/index.html` for aggregate statistics
 - `report/forensic/index.html` for forensic report statistics
 
 ## Current aggregations
