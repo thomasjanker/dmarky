@@ -551,9 +551,6 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
         <table class="table table-striped table-sm align-middle">
           <thead class="table-light">
           <tr>
-            <th>Source IP</th>
-            <th>Report Day</th>
-            <th>Report Origin</th>
             <th>Message Count</th>
             <th>DMARC Compliance</th>
             <th>Disposition</th>
@@ -652,19 +649,40 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
         'Source IP details: ' + ip + ' (' + items.length + ' of ' + allItems.length + ' records)';
 
       if (items.length === 0) {{
-        body.innerHTML = '<tr><td colspan=\"9\">No details available.</td></tr>';
+        body.innerHTML = '<tr><td colspan=\"6\">No details available.</td></tr>';
       }} else {{
-        body.innerHTML = items.map((item) => (
+        const grouped = {{}};
+        items.forEach((item) => {{
+          const key = [
+            item.dmarc_compliant ? 'pass' : 'fail',
+            item.disposition || 'unknown',
+            item.spf || 'unknown',
+            item.dkim || 'unknown',
+            item.header_from || 'unknown'
+          ].join('||');
+
+          if (!grouped[key]) {{
+            grouped[key] = {{
+              message_count: 0,
+              dmarc_compliance: item.dmarc_compliant ? 'pass' : 'fail',
+              disposition: item.disposition || 'unknown',
+              spf: item.spf || 'unknown',
+              dkim: item.dkim || 'unknown',
+              header_from: item.header_from || 'unknown'
+            }};
+          }}
+          grouped[key].message_count += Number(item.count || 0);
+        }});
+
+        const groupedRows = Object.values(grouped).sort((a, b) => b.message_count - a.message_count);
+        body.innerHTML = groupedRows.map((row) => (
           '<tr>' +
-            '<td>' + escapeHtml(item.source_ip) + '</td>' +
-            '<td>' + escapeHtml(item.report_day || 'unknown') + '</td>' +
-            '<td>' + escapeHtml((item.report_org_name || 'unknown') + ' <' + (item.report_email || 'unknown') + '>') + '</td>' +
-            '<td>' + item.count + '</td>' +
-            '<td>' + (item.dmarc_compliant ? 'pass' : 'fail') + '</td>' +
-            '<td>' + escapeHtml(item.disposition) + '</td>' +
-            '<td>' + escapeHtml(item.spf) + '</td>' +
-            '<td>' + escapeHtml(item.dkim) + '</td>' +
-            '<td>' + escapeHtml(item.header_from) + '</td>' +
+            '<td>' + row.message_count + '</td>' +
+            '<td>' + row.dmarc_compliance + '</td>' +
+            '<td>' + escapeHtml(row.disposition) + '</td>' +
+            '<td>' + escapeHtml(row.spf) + '</td>' +
+            '<td>' + escapeHtml(row.dkim) + '</td>' +
+            '<td>' + escapeHtml(row.header_from) + '</td>' +
           '</tr>'
         )).join('');
       }}
