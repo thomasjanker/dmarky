@@ -36,7 +36,6 @@ struct ReportRecord {
     disposition: String,
     dkim: String,
     spf: String,
-    dmarc_compliant: bool,
     header_from: String,
     report_day: String,
     report_org_name: String,
@@ -46,8 +45,6 @@ struct ReportRecord {
 #[derive(Debug, Serialize, Default, Clone)]
 struct SourceIpStats {
     total_messages: u64,
-    dmarc_compliant_messages: u64,
-    dmarc_non_compliant_messages: u64,
     spf_pass_messages: u64,
     spf_fail_messages: u64,
     dkim_pass_messages: u64,
@@ -224,7 +221,6 @@ fn process_aggregate_xml(doc: &Document<'_>, aggregates: &mut Aggregates) -> Res
         let dkim = child_text(record, "row/policy_evaluated/dkim").unwrap_or_else(|| "unknown".to_string());
         let spf = child_text(record, "row/policy_evaluated/spf").unwrap_or_else(|| "unknown".to_string());
         let header_from = child_text(record, "identifiers/header_from").unwrap_or_else(|| "unknown".to_string());
-        let dmarc_compliant = spf.eq_ignore_ascii_case("pass") || dkim.eq_ignore_ascii_case("pass");
 
         aggregates.total_records += 1;
         aggregates.total_messages += count;
@@ -242,7 +238,6 @@ fn process_aggregate_xml(doc: &Document<'_>, aggregates: &mut Aggregates) -> Res
             disposition,
             dkim,
             spf,
-            dmarc_compliant,
             header_from,
             report_day: report_day.clone(),
             report_org_name: report_org_name.clone(),
@@ -347,16 +342,9 @@ fn update_source_ip_stats(
 ) {
     let spf_pass = spf.eq_ignore_ascii_case("pass");
     let dkim_pass = dkim.eq_ignore_ascii_case("pass");
-    let dmarc_compliant = spf_pass || dkim_pass;
 
     let stats = stats_map.entry(source_ip.to_string()).or_default();
     stats.total_messages += count;
-
-    if dmarc_compliant {
-        stats.dmarc_compliant_messages += count;
-    } else {
-        stats.dmarc_non_compliant_messages += count;
-    }
 
     if spf_pass {
         stats.spf_pass_messages += count;
@@ -537,8 +525,6 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
       <th>Source IP</th>
       <th>Resolved Hostname</th>
       <th>Message Count</th>
-      <th>DMARC Compliant</th>
-      <th>DMARC Non-Compliant</th>
       <th>SPF Pass</th>
       <th>SPF Fail</th>
       <th>DKIM Pass</th>
@@ -582,7 +568,6 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
           <thead class="table-light">
           <tr>
             <th>Message Count</th>
-            <th>DMARC Compliance</th>
             <th>Disposition</th>
             <th>SPF</th>
             <th>DKIM</th>
@@ -712,7 +697,6 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
         const grouped = {{}};
         allItems.forEach((item) => {{
           const key = [
-            item.dmarc_compliant ? 'pass' : 'fail',
             item.disposition || 'unknown',
             item.spf || 'unknown',
             item.dkim || 'unknown',
@@ -722,7 +706,6 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
           if (!grouped[key]) {{
             grouped[key] = {{
               message_count: 0,
-              dmarc_compliance: item.dmarc_compliant ? 'pass' : 'fail',
               disposition: item.disposition || 'unknown',
               spf: item.spf || 'unknown',
               dkim: item.dkim || 'unknown',
@@ -736,7 +719,6 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
         body.innerHTML = groupedRows.map((row, idx) => (
           '<tr class=\"detail-row-clickable\" data-group-idx=\"' + idx + '\">' +
             '<td>' + row.message_count + '</td>' +
-            '<td>' + row.dmarc_compliance + '</td>' +
             '<td>' + escapeHtml(row.disposition) + '</td>' +
             '<td>' + escapeHtml(row.spf) + '</td>' +
             '<td>' + escapeHtml(row.dkim) + '</td>' +
@@ -751,9 +733,7 @@ fn render_aggregate_html(aggregates: &Aggregates) -> Result<String> {
 
             const selected = groupedRows[Number(rowEl.dataset.groupIdx)];
             const filtered = currentItems.filter((item) => {{
-              const dmarc = item.dmarc_compliant ? 'pass' : 'fail';
-              return dmarc === selected.dmarc_compliance
-                && (item.disposition || 'unknown') === selected.disposition
+              return (item.disposition || 'unknown') === selected.disposition
                 && (item.spf || 'unknown') === selected.spf
                 && (item.dkim || 'unknown') === selected.dkim
                 && (item.header_from || 'unknown') === selected.header_from;
@@ -938,13 +918,11 @@ fn render_source_ip_rows(
             .unwrap_or_else(|| "unresolved".to_string());
         let stats = stats_map.get(ip.as_str()).cloned().unwrap_or_default();
         rows.push_str(&format!(
-            "<tr class=\"source-ip-row clickable-row\" data-source-ip=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr class=\"source-ip-row clickable-row\" data-source-ip=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape_html(ip),
             escape_html(ip),
             escape_html(&hostname),
             count,
-            stats.dmarc_compliant_messages,
-            stats.dmarc_non_compliant_messages,
             stats.spf_pass_messages,
             stats.spf_fail_messages,
             stats.dkim_pass_messages,
